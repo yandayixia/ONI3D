@@ -36,7 +36,7 @@ const MOSS_CHANCE = 0.15;
 const MOSS_CHANCE_WET = 0.8;
 const WATER_RADIUS = 20;
 const VINE_CHANCE = 0.2;
-const VINE_MAX = 5;
+const VINE_MAX = 20;
 const FLOWER_CHANCE = 0.1;
 /** Colonist height in tiles; flower sizes are fractions of it. */
 const COLONIST_H = 2;

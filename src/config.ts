@@ -7,7 +7,7 @@ export const TILE_TEX = 32;
 
 // Simulation rates
 export const PHYSICS_DT = 1 / 60;
-export const WATER_DT = 1 / 10;
+export const WATER_DT = 1 / 5;
 
 // Colonist body (tile units). Rendered as 1x2; the collision box is a bit
 // smaller so colonists fit 1-wide shafts and 2-tall tunnels without snagging.

@@ -1,8 +1,14 @@
 import { TILE_TEX } from '../config';
 import { Flower, Vine } from '../world/foliage';
-import { hash3, hsvToRgb, lerpRGB, makeBuf, PixelBuf, putPixel, RGB } from './tileArt';
+import { hash3, hsvToRgb, lerpRGB, makeBuf, NOISE_RES, PixelBuf, putPixel, RGB } from './tileArt';
 
 const N = TILE_TEX;
+/**
+ * Moss, grass and vines are authored in cells of the terrain noise grid
+ * (A x A cells per tile, each TILE_TEX / A texels), so they match the terrain's
+ * pixel size. Spec fractions of a tile are converted to whole cells below.
+ */
+const A = NOISE_RES;
 
 export const FLOOR_MOSS: RGB = [92, 150, 64];
 const FLOOR_MOSS_DARK: RGB = [64, 112, 50];
@@ -19,33 +25,40 @@ const GRASS: RGB[] = [
 const GRASS_TIP: RGB = [150, 210, 104];
 const VINE: RGB = [72, 138, 58];
 const VINE_DARK: RGB = [52, 108, 46];
-const VINE_SPIKE: RGB = [234, 242, 228];
+export const VINE_SPIKE: RGB = [234, 242, 228];
 const SHAFT: RGB = [66, 124, 54];
 const LEAF: RGB = [92, 160, 70];
 
-/** Grass sprites are this many TILE_TEX rows tall (the tallest patch plus room to lean). */
-export const GRASS_ROWS = 14;
+/** Grass sprites are A cells wide and this many cells tall: the tallest patch (0.4 tile ≈ 3 cells). */
+export const GRASS_ROWS = 3;
 export const GRASS_VARIANTS = 16;
 /** Flower sprites are this many texels wide, centred on the stem. */
 export const FLOWER_W = 15;
 
 /**
- * Plots art authored on the TILE_TEX grid into a buffer at another texel
- * density (`tex` texels per tile), offset by pixel (ox, oy). Writes outside
- * the buffer are clipped, so art may spill across chunk edges.
+ * Plots art authored on a grid of `unit` cells per tile into a buffer at
+ * `tex` texels per tile, with the art's (0, 0) at pixel (ox, oy). Each cell
+ * fills its whole scaled block. Writes outside the buffer are clipped, so art
+ * may spill across chunk edges.
  */
 export class Painter {
   private readonly s: number;
 
-  constructor(readonly buf: PixelBuf, readonly ox: number, readonly oy: number, tex = N) {
-    this.s = tex / N;
+  constructor(readonly buf: PixelBuf, readonly ox: number, readonly oy: number, tex = N, unit = A) {
+    this.s = tex / unit;
   }
 
   dot(gx: number, gy: number, c: RGB): void {
-    putPixel(this.buf, this.ox + Math.floor(gx * this.s), this.oy + Math.floor(gy * this.s), c);
+    const x0 = this.ox + Math.floor(gx * this.s);
+    const y0 = this.oy + Math.floor(gy * this.s);
+    const x1 = Math.max(x0 + 1, this.ox + Math.floor((gx + 1) * this.s));
+    const y1 = Math.max(y0 + 1, this.oy + Math.floor((gy + 1) * this.s));
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) putPixel(this.buf, x, y, c);
+    }
   }
 
-  /** Copies the opaque pixels of a TILE_TEX-grid sprite with its top-left at (gx, gy). */
+  /** Copies the opaque pixels of a sprite (in this painter's units) with its top-left at (gx, gy). */
   blit(src: PixelBuf, gx: number, gy: number): void {
     const d = src.data;
     for (let y = 0; y < src.height; y++) {
@@ -57,96 +70,109 @@ export class Painter {
   }
 }
 
+/** Splits a tile's A columns into runs 1 or 2 cells wide, so moss edges step in chunks. */
+export function mossSegments(tx: number, ty: number, salt: number): number[] {
+  const widths: number[] = [];
+  for (let x = 0; x < A; ) {
+    const w = x === A - 1 || hash3(tx * A + x, ty, salt) < 0.5 ? 1 : 2;
+    widths.push(w);
+    x += w;
+  }
+  return widths;
+}
+
 /**
  * Floor moss on tile (tx, ty), with the painter's origin at the tile's
- * top-left: a bumpy 1–7 row carpet on the tile's top, with tufts reaching
- * 1–3 rows (1–10%) into the tile above.
+ * top-left: a carpet 1–2 cells deep (the spec's 1–7 texel rows) on top of the
+ * tile, with tufts filling the bottom cell (1–10%) of the tile above. Both
+ * step in 1–2 cell wide runs. Cells cut from the tile's corners (and tufts
+ * above them) are skipped.
  */
-export function paintFloorMoss(p: Painter, tx: number, ty: number): void {
-  for (let gx = 0; gx < N; gx++) {
-    const wx = tx * N + gx;
-    // Depth changes in 2-texel steps so the edge reads as chunky pixel art.
-    const depth = 1 + Math.floor(hash3(wx >> 1, ty, 11) * 7);
-    for (let gy = 0; gy < depth; gy++) {
-      const r = hash3(wx, ty * N + gy, 12);
-      p.dot(gx, gy, gy === depth - 1 ? FLOOR_MOSS_DARK : r < 0.2 ? FLOOR_MOSS_LIGHT : FLOOR_MOSS);
+export function paintFloorMoss(p: Painter, tx: number, ty: number, cut: Uint8Array | null = null): void {
+  let x = 0;
+  for (const w of mossSegments(tx, ty, 11)) {
+    const depth = 1 + Math.floor(hash3(tx * A + x, ty, 12) * 2);
+    const tuft = hash3(tx * A + x, ty, 13) < 0.5;
+    for (let gx = x; gx < x + w; gx++) {
+      for (let gy = 0; gy < depth; gy++) {
+        if (cut?.[gy * A + gx]) continue;
+        const light = hash3(tx * A + gx, ty * A + gy, 14) < 0.2;
+        p.dot(gx, gy, depth > 1 && gy === depth - 1 ? FLOOR_MOSS_DARK : light ? FLOOR_MOSS_LIGHT : FLOOR_MOSS);
+      }
+      if (tuft && !cut?.[gx]) p.dot(gx, -1, FLOOR_MOSS_LIGHT);
     }
-    const tuft = 1 + Math.floor(hash3(wx, ty, 13) ** 2 * 3);
-    for (let k = 1; k <= tuft; k++) p.dot(gx, -k, k === tuft ? FLOOR_MOSS_LIGHT : FLOOR_MOSS);
+    x += w;
   }
 }
 
 /**
  * Ceiling moss on tile (tx, ty), with the painter's origin at the tile's
- * top-left: a web of diagonal strands covering the bottom 20–50% of the tile
- * and the top 10–20% of the tile below.
+ * top-left: a web over the bottom 2–4 cells (20–50%) of the tile and 1–2
+ * cells (10–20%) of the tile below, in 1–2 cell wide runs. The rows touching
+ * the rock face are solid; further out the web has holes. Cells cut from the
+ * tile's corners (and the spill below them) are skipped.
  */
-export function paintCeilingMoss(p: Painter, tx: number, ty: number): void {
-  const cover = Math.round((0.2 + hash3(tx, ty, 21) * 0.3) * N);
-  const below = Math.round((0.1 + hash3(tx, ty, 22) * 0.1) * N);
-  for (let gx = 0; gx < N; gx++) {
-    const wx = tx * N + gx;
-    const top = N - Math.round(cover * (0.6 + 0.4 * hash3(wx >> 1, ty, 23)));
-    const bottom = N + Math.round(below * (0.4 + 0.6 * hash3(wx, ty, 24)));
-    for (let gy = top; gy < bottom; gy++) {
-      const web = (gx + gy) % 4 === 0 || (gx - gy + 64) % 4 === 0;
-      const r = hash3(wx, ty * N + gy, 25);
-      if (gy === bottom - 1) p.dot(gx, gy, CEILING_MOSS_DARK);
-      else if (web) p.dot(gx, gy, r < 0.25 ? CEILING_MOSS_LIGHT : CEILING_MOSS);
-      else if (gy >= N - 2 && gy <= N + 1) p.dot(gx, gy, CEILING_MOSS); // dense band along the rock face
-      else if (r < 0.15) p.dot(gx, gy, CEILING_MOSS_DARK);
+export function paintCeilingMoss(p: Painter, tx: number, ty: number, cut: Uint8Array | null = null): void {
+  let x = 0;
+  for (const w of mossSegments(tx, ty, 21)) {
+    const top = A - 2 - Math.floor(hash3(tx * A + x, ty, 22) * 3);
+    const bottom = A + 1 + Math.floor(hash3(tx * A + x, ty, 23) * 2);
+    for (let gx = x; gx < x + w; gx++) {
+      for (let gy = top; gy < bottom; gy++) {
+        if (cut?.[Math.min(gy, A - 1) * A + gx]) continue;
+        const r = hash3(tx * A + gx, ty * A + gy, 24);
+        if (gy === bottom - 1) p.dot(gx, gy, CEILING_MOSS_DARK);
+        else if (gy === A - 1 || gy === A) p.dot(gx, gy, CEILING_MOSS);
+        else if ((gx + gy) % 2 === 0 || r < 0.3) p.dot(gx, gy, r < 0.25 ? CEILING_MOSS_LIGHT : CEILING_MOSS);
+      }
     }
+    x += w;
   }
 }
 
 /**
- * One grass patch, TILE_TEX wide and GRASS_ROWS tall, bottom-aligned: 0.15–0.4
- * tile tall strokes in several greens. Roots use the floor-moss colour so the
- * patch blends into the moss under it.
+ * One grass patch, A cells wide and GRASS_ROWS tall, bottom-aligned: blades
+ * one cell wide, 2–3 cells tall (0.25–0.375 tile) at most. Roots use the
+ * floor-moss colour so the patch blends into the moss under it.
  */
 export function grassSprite(variant: number): PixelBuf {
-  const buf = makeBuf(N, GRASS_ROWS);
-  const patch = Math.round((0.15 + hash3(variant, 0, 31) * 0.25) * N);
-  for (let gx = 1; gx < N - 1; gx += 2) {
-    if (hash3(variant, gx, 32) < 0.2) continue;
-    const h = Math.max(2, Math.round(patch * (0.5 + 0.5 * hash3(variant, gx, 33))));
-    const lean = Math.floor(hash3(variant, gx, 34) * 3) - 1;
+  const buf = makeBuf(A, GRASS_ROWS);
+  const patch = 2 + Math.floor(hash3(variant, 0, 31) * 2);
+  for (let gx = 0; gx < A; gx++) {
+    if (hash3(variant, gx, 32) < 0.3) continue;
+    const h = 1 + Math.floor(hash3(variant, gx, 33) * patch);
     const shade = GRASS[Math.floor(hash3(variant, gx, 35) * GRASS.length)];
     for (let k = 0; k < h; k++) {
-      const x = gx + Math.trunc((lean * k) / 4);
-      const c = k < 2 ? FLOOR_MOSS : k === h - 1 ? GRASS_TIP : shade;
-      putPixel(buf, x, GRASS_ROWS - 1 - k, c);
+      putPixel(buf, gx, GRASS_ROWS - 1 - k, k === 0 ? FLOOR_MOSS : k === h - 1 ? GRASS_TIP : shade);
     }
   }
   return buf;
 }
 
 /**
- * A hanging vine, TILE_TEX wide and `length` tiles tall: a wandering two-pixel
- * stem with white spike pixels. The top fades in from the ceiling-moss colour
- * so it grows seamlessly out of the moss above.
+ * A hanging vine, A cells wide and `length` tiles tall: a knobbly stem 2–3
+ * cells wide that wanders a cell at a time, with white spike cells beside it
+ * and a one-cell tip. The top fades in from the ceiling-moss colour so it
+ * grows seamlessly out of the moss above.
  */
 export function vineSprite(v: Vine): PixelBuf {
-  const h = v.length * N;
-  const buf = makeBuf(N, h);
-  let x = 14 + Math.floor(hash3(v.x, v.y, 41) * 4);
+  const h = v.length * A;
+  const buf = makeBuf(A, h);
+  let x = 2 + Math.floor(hash3(v.x, v.y, 41) * 2);
+  let w = 2;
   for (let y = 0; y < h; y++) {
-    if (y > 0 && y % 4 === 0) {
-      const r = hash3(v.x, v.y * N + y, 42);
-      x = Math.max(10, Math.min(N - 12, x + (r < 0.3 ? -1 : r > 0.7 ? 1 : 0)));
+    if (y % 2 === 0) {
+      w = hash3(v.x, v.y * A + y, 44) < 0.5 ? 2 : 3;
+      const r = hash3(v.x, v.y * A + y, 42);
+      if (y > 0) x += r < 0.3 ? -1 : r > 0.7 ? 1 : 0;
+      x = Math.max(1, Math.min(A - 1 - w, x));
     }
-    const stem = y < 8 ? lerpRGB(CEILING_MOSS, VINE, y / 8) : VINE;
-    const tip = y >= h - 3;
-    putPixel(buf, x, y, stem);
-    if (!tip) putPixel(buf, x + 1, y, y < 8 ? stem : VINE_DARK);
-    const r = hash3(v.x, v.y * N + y, 43);
-    if (!tip && y > 4 && r < 0.18) putPixel(buf, r < 0.09 ? x - 1 : x + 2, y, VINE_SPIKE);
-    else if (!tip && y > 6 && r > 0.94) {
-      // A small leaf.
-      const side = r > 0.97 ? 1 : -1;
-      putPixel(buf, side > 0 ? x + 2 : x - 1, y, VINE);
-      putPixel(buf, side > 0 ? x + 3 : x - 2, y - 1, VINE);
-    }
+    const tip = y === h - 1;
+    const width = tip ? 1 : w;
+    const stem = y < 2 ? lerpRGB(CEILING_MOSS, VINE, y / 2) : VINE;
+    for (let i = 0; i < width; i++) putPixel(buf, x + i, y, y >= 2 && i === width - 1 && !tip ? VINE_DARK : stem);
+    const r = hash3(v.x, v.y * A + y, 43);
+    if (!tip && y >= 2 && r < 0.2) putPixel(buf, r < 0.1 ? x - 1 : x + width, y, VINE_SPIKE);
   }
   return buf;
 }

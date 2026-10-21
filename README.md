@@ -46,7 +46,7 @@ While colonists are selected, the hovered tile is outlined yellow (dig), red (ca
 
 Colonists can stand on dirt and rock. Water is passable: colonists walk and sink through it. The map edge acts as solid rock.
 
-Each tile is drawn as a 32×32 procedural texture:
+Each tile is drawn as a 32×32 procedural texture. Its colour noise is on a coarser 8×8 grid of cells, each covering 4×4 texels. Moss, grass and vines are drawn on the same cell grid, so they share the terrain's pixel size; flowers keep the full 32×32 detail.
 
 | Tile | Base colour | Surface colour | Pixel noise (hue / saturation / brightness) |
 | --- | --- | --- | --- |
@@ -54,7 +54,18 @@ Each tile is drawn as a 32×32 procedural texture:
 | Rock | rgb(111, 115, 126) | rgb(151, 156, 167) | 5% / 12% / 7% |
 | Water | rgb(75, 134, 206) | rgb(127, 182, 238) | 2% / 5% / 3% |
 
-The base colour is layer 20 and the per-pixel noise is layer 21. When a tile has open space above it, its top 8 rows use the surface colour and the noise there is drawn at 50% opacity. For dirt and rock, "open" means not solid, so water above still shows the surface. For water, it means an empty tile. The noise is hashed from the pixel's position, so a tile looks the same every time it is redrawn.
+The base colour is layer 20 and the noise is layer 21. When a tile has open space above it, its top 8 rows (a quarter of the tile, two rows of noise cells) use the surface colour and the noise there is drawn at 50% opacity. For dirt and rock, "open" means not solid, so water above still shows the surface. For water, it means an empty tile. The noise is hashed from the cell's position, so a tile looks the same every time it is redrawn.
+
+Outer corners aren't sharp. A dirt or rock tile that is open on two adjacent sides (for example above and to the right) has that corner cut away on the cell grid, showing the cave wall behind. Both tile types use the same cut: a smooth staircase, 2–3 cells wide, shrinking by one cell every one or two rows.
+
+Each corner reaches at most 4 cells along either edge, and a tile can have up to four cut corners. Shapes are hashed from the tile's position and randomly mirrored across the diagonal, so every corner is slightly different but stays the same when redrawn. Moss and grass skip the cut cells. The cuts are visual only: collision and pathfinding still treat the whole tile as solid.
+
+Water fills the cut corners that face it, so pools don't show gaps at rounded edges. For each water tile, the cut cells on the water's side of these neighbours are drawn as water:
+- the tiles to its left and right (their near corners);
+- the tile below (its top corners);
+- the tiles diagonally below-left and below-right (the top corner touching the water).
+
+Water below or above a terrain tile's bottom corners never fills them.
 
 ### Foliage
 
@@ -65,18 +76,18 @@ Foliage is decoration only: it never affects pathfinding or movement. It lives i
    - dirt: always, if the tiles on both sides are dirt too.
 2. **Ceiling moss** follows the same rules for solid tiles with an empty tile below. A one-tile-thick shelf qualifies for both; ceiling moss wins.
 3. **Grass** grows in the empty tile above a floor-moss tile that has another floor-moss tile to its left or right.
-4. **Hanging vines**: each ceiling-moss tile has a 20% chance of a vine. Its length is random, between 1 and the number of open tiles below it (empty in both arrays), up to 5.
+4. **Hanging vines**: each ceiling-moss tile has a 20% chance of a vine. Its length is random, between 1 and the number of open tiles below it (empty in both arrays), up to 20.
 5. **Background flowers**: 10% of grass tiles. They are 10–40% of a colonist's height, ±10%.
 6. **Foreground flowers**: 10% of grass tiles, rolled independently. They are 30–55% of a colonist's height, ±15%, kept below a solid tile directly above.
 
-Each foliage type is drawn in pixel art:
+Each foliage type is drawn in pixel art (a cell is 1/8 of a tile):
 
 | Foliage | Look |
 | --- | --- |
-| Floor moss | Covers the top 1–7 pixel rows of its tile and reaches 1–3 rows into the tile above. |
-| Ceiling moss | A dark, web-like net over the bottom 20–50% of its tile and the top 10–20% of the tile below. |
-| Grass | Green strokes 0.15–0.4 tiles tall, with moss-coloured roots. |
-| Vines | Green, with white spike pixels. They fade in from the ceiling-moss colour at the top. |
+| Floor moss | Covers the top 1–2 cells of its tile, with tufts filling the bottom cell of the tile above. Its edge steps in runs 1–2 cells wide. |
+| Ceiling moss | A dark, web-like net over the bottom 2–4 cells (20–50%) of its tile and 1–2 cells (10–20%) of the tile below, in runs 1–2 cells wide. |
+| Grass | Blades one cell wide and up to 3 cells tall, in several greens, with moss-coloured roots. |
+| Vines | A green stem 2–3 cells wide with white spike cells. They fade in from the ceiling-moss colour at the top. |
 | Flowers | A stem, leaves on both sides (0–3 for background flowers, 1–5 for foreground) and a random petal colour. Background flowers have a darker centre, foreground flowers a lighter one. |
 
 Grass wiggles briefly when a colonist enters or leaves it. Vines swing like a damped pendulum, pushed in the direction the colonist is moving.
@@ -103,7 +114,7 @@ Layers 0–9, 11–19, 27–30 and 32–49 are free for future use. Selection, h
 
 ### Water
 
-Water updates 10 times per second. Each water tile:
+Water updates 5 times per second. Each water tile:
 
 1. Falls 1 tile if the tile below is empty.
 2. Stays put if the tile below is dirt or rock.
@@ -160,7 +171,7 @@ Water overwrites whatever was there. Once the simulation runs, it falls and spre
 | Path | Purpose |
 | --- | --- |
 | `index.html` | Page shell: full-window canvas and HUD |
-| `src/main.ts` | Boot, fixed-timestep game loop (physics 60 Hz, water 10 Hz), HUD |
+| `src/main.ts` | Boot, fixed-timestep game loop (physics 60 Hz, water 5 Hz), HUD |
 | `src/config.ts` | All tuning constants |
 | `src/world/tiles.ts` | Tile types and the solidity rule |
 | `src/world/World.ts` | Tile grid, change counters for terrain and water |
@@ -177,7 +188,8 @@ Water overwrites whatever was there. Once the simulation runs, it falls and spre
 | `src/render/Camera.ts` | Pan/zoom and screen-to-world conversion |
 | `src/render/Renderer.ts` | Runs the layer passes: chunk-cached terrain and moss, foliage, colonists, water, overlays |
 | `src/render/layers.ts` | Render layer numbers |
-| `src/render/tileArt.ts` | Procedural tile and wall textures (pure; no DOM) |
+| `src/render/tileArt.ts` | Procedural tile and wall textures, corner cuts (pure; no DOM) |
+| `src/render/terrainEdges.ts` | Corner cuts per world tile, and which cut corners water fills (pure; no DOM) |
 | `src/render/foliageArt.ts` | Pixel-art moss, grass, vine and flower generators (pure; no DOM) |
 | `tests/` | Vitest tests for worldgen, edge jagging, foliage, tile and foliage art, animation, water, pathfinding, colonists and a full game run |
 

@@ -72,17 +72,20 @@ describe('generateFoliage: grass, vines and flowers', () => {
     expect(show(map)[1]).toBe('.ggg.');
   });
 
-  it('limits vine length to the open tiles below, up to 5', () => {
+  it('limits vine length to the open tiles below, up to 20', () => {
     // Vine roll, then length roll, for each ceiling moss tile.
     const short = generateFoliage(worldFromAscii(['ddddd', '.....', '.....', '.....', '~~~~~']), cycle(0.1, 0.99));
     expect(short.vines.map((v) => v.length)).toEqual([3, 3, 3]);
-    const long = generateFoliage(worldFromAscii(['ddddd', ...Array(7).fill('.....'), '~~~~~']), cycle(0.1, 0.99));
-    expect(long.vines.map((v) => v.length)).toEqual([5, 5, 5]);
+    const long = generateFoliage(worldFromAscii(['ddddd', ...Array(25).fill('.....'), '~~~~~']), cycle(0.1, 0.99));
+    expect(long.vines.map((v) => v.length)).toEqual([20, 20, 20]);
     for (const v of long.vines) {
       expect(long.get(v.x, v.y - 1)).toBe(Foliage.CeilingMoss);
-      for (let k = 0; k < 5; k++) expect(long.get(v.x, v.y + k)).toBe(Foliage.Vine);
-      expect(long.get(v.x, v.y + 5)).toBe(Foliage.Empty);
+      for (let k = 0; k < 20; k++) expect(long.get(v.x, v.y + k)).toBe(Foliage.Vine);
+      expect(long.get(v.x, v.y + 20)).toBe(Foliage.Empty);
     }
+    // The shortest roll still gives a 1-tile vine.
+    const shortest = generateFoliage(worldFromAscii(['ddddd', ...Array(25).fill('.....'), '~~~~~']), cycle(0.1, 0));
+    expect(shortest.vines.map((v) => v.length)).toEqual([1, 1, 1]);
   });
 
   it('puts flowers only on grass, outside the foliage array, and keeps foreground flowers under a low ceiling', () => {

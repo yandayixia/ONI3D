@@ -93,6 +93,11 @@ export const TILE_STYLE: Partial<Record<Tile, TileStyle>> = {
 
 /** Rows (of TILE_TEX) that use the surface colour when a tile is exposed. */
 export const SURFACE_ROWS = 8;
+/**
+ * Pixel noise cells per tile side; each cell spans TILE_TEX / NOISE_RES texels
+ * at full detail. Moss, grass and vines are drawn on the same cell grid.
+ */
+export const NOISE_RES = 8;
 /** Opacity of the noise layer (21) inside the surface band. */
 export const SURFACE_NOISE_ALPHA = 0.5;
 
@@ -133,24 +138,38 @@ function palette(tile: Tile, surface: boolean): Uint8Array {
  * Layer 20 is the base colour, with the top SURFACE_ROWS replaced by the
  * surface colour when `exposed`; layer 21 is per-pixel HSV noise over it, at
  * SURFACE_NOISE_ALPHA inside the surface band. Noise is hashed from the
- * position on the TILE_TEX grid, so repaints and lower detail levels match.
+ * position on a NOISE_RES x NOISE_RES grid per tile, so repaints and every
+ * detail level match. Cells set in `cut` (see cornerCuts) are left unpainted.
  */
-export function paintTile(buf: PixelBuf, ox: number, oy: number, tex: number, tile: Tile, tx: number, ty: number, exposed: boolean): void {
+export function paintTile(
+  buf: PixelBuf,
+  ox: number,
+  oy: number,
+  tex: number,
+  tile: Tile,
+  tx: number,
+  ty: number,
+  exposed: boolean,
+  cut: Uint8Array | null = null,
+): void {
   if (!TILE_STYLE[tile]) return;
   const body = palette(tile, false);
   const top = palette(tile, true);
   const band = exposed ? Math.round((SURFACE_ROWS * tex) / TILE_TEX) : 0;
-  const step = TILE_TEX / tex;
+  const step = NOISE_RES / tex;
   const d = buf.data;
   for (let sy = 0; sy < tex; sy++) {
     const y = oy + sy;
     if (y < 0 || y >= buf.height) continue;
     const pal = sy < band ? top : body;
-    const gy = ty * TILE_TEX + Math.floor(sy * step);
+    const cy = Math.floor(sy * step);
+    const gy = ty * NOISE_RES + cy;
     for (let sx = 0; sx < tex; sx++) {
       const x = ox + sx;
       if (x < 0 || x >= buf.width) continue;
-      const k = (hashInt(tx * TILE_TEX + Math.floor(sx * step), gy, tile) % PAL) * 3;
+      const cx = Math.floor(sx * step);
+      if (cut && cut[cy * NOISE_RES + cx]) continue;
+      const k = (hashInt(tx * NOISE_RES + cx, gy, tile) % PAL) * 3;
       const o = (y * buf.width + x) * 4;
       d[o] = pal[k];
       d[o + 1] = pal[k + 1];
@@ -158,6 +177,61 @@ export function paintTile(buf: PixelBuf, ox: number, oy: number, tex: number, ti
       d[o + 3] = 255;
     }
   }
+}
+
+/** Corner cuts reach at most this many cells along either edge. */
+const CUT_ROWS = 4;
+
+/**
+ * Row widths (in cells, starting at the corner's edge row) of the notch cut
+ * from one exposed corner: a smooth staircase 2–3 cells wide, shrinking by
+ * one cell every one or two rows. Dirt and rock share it.
+ */
+function cornerProfile(tx: number, ty: number, corner: number): number[] {
+  const h = (k: number) => hash3(tx * 4 + corner, ty, 60 + k);
+  const rows: number[] = [];
+  let w = 2 + Math.floor(h(0) * 2);
+  let held = false;
+  while (w > 0 && rows.length < CUT_ROWS) {
+    rows.push(w);
+    // Each width lasts one or two rows.
+    if (!held && h(rows.length) < 0.4) {
+      held = true;
+    } else {
+      w--;
+      held = false;
+    }
+  }
+  return rows;
+}
+
+/**
+ * Cells (NOISE_RES x NOISE_RES, 1 = removed) knocked out of a dirt or rock
+ * tile's corners where it is open on both adjacent sides, so outer corners
+ * are not sharp. Each corner's shape is hashed from the tile position and
+ * randomly mirrored across its diagonal, so every corner differs but repaints
+ * match. Returns null when the tile has no exposed corner. Visual only.
+ */
+export function cornerCuts(tile: Tile, tx: number, ty: number, top: boolean, right: boolean, bottom: boolean, left: boolean): Uint8Array | null {
+  if (tile !== Tile.Dirt && tile !== Tile.Rock) return null;
+  const corners = [top && left, top && right, bottom && left, bottom && right];
+  if (!corners.some(Boolean)) return null;
+  const A = NOISE_RES;
+  const cut = new Uint8Array(A * A);
+  corners.forEach((exposed, corner) => {
+    if (!exposed) return;
+    const flip = hash3(tx * 4 + corner, ty, 59) < 0.5;
+    cornerProfile(tx, ty, corner).forEach((w, k) => {
+      for (let i = 0; i < w; i++) {
+        // Distance from the corner along x (i) and y (k), optionally swapped.
+        const [dx, dy] = flip ? [k, i] : [i, k];
+        const x = corner & 1 ? A - 1 - dx : dx;
+        const y = corner & 2 ? A - 1 - dy : dy;
+        cut[y * A + x] = 1;
+      }
+    });
+  });
+  return cut;
 }
 
 const WALL: RGB = [36, 31, 33];

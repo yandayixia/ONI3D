@@ -19,7 +19,8 @@ import {
   vineSprite,
 } from './foliageArt';
 import { Layer } from './layers';
-import { PixelBuf, hashInt, makeBuf, paintTile, paintWall } from './tileArt';
+import { cutsAt, filledCells, waterCornerFills } from './terrainEdges';
+import { NOISE_RES, PixelBuf, hashInt, makeBuf, paintTile, paintWall } from './tileArt';
 
 /** The world is baked in CHUNK x CHUNK tile pieces, rebuilt only when their tiles change. */
 const CHUNK = 16;
@@ -116,6 +117,8 @@ export class Renderer {
   private readonly vineSprites = new Map<Vine, HTMLCanvasElement>();
   private readonly flowerBufs = new Map<Flower, PixelBuf>();
   private readonly flowerSprites = new Map<Flower, HTMLCanvasElement>();
+  /** Corner cuts per tile index; they depend only on solid tiles, so cleared when the terrain changes. */
+  private readonly cutCache = new Map<number, Uint8Array | null>();
 
   constructor(private readonly canvas: HTMLCanvasElement, world: World) {
     this.ctx = canvas.getContext('2d')!;
@@ -207,6 +210,7 @@ export class Renderer {
       for (const f of this.flowerBufs.keys()) if (!flowers.has(f)) this.flowerBufs.delete(f);
       for (const f of this.flowerSprites.keys()) if (!flowers.has(f)) this.flowerSprites.delete(f);
     }
+    if (world.version !== this.worldVersion) this.cutCache.clear();
     this.worldVersion = world.version;
     this.foliageVersion = foliage.version;
     const { width: w, tiles } = world;
@@ -261,18 +265,22 @@ export class Renderer {
     const cw = Math.min(CHUNK, world.width - tx0);
     const chh = Math.min(CHUNK, world.height - ty0);
 
-    // Layer 10: the cave wall behind every open tile, then background flowers.
+    // Layer 10: the cave wall behind every open tile and every cut corner,
+    // then background flowers.
     const back = new ImageData(cw * tex, chh * tex);
+    const cuts = new Map<number, Uint8Array>();
     for (let ty = ty0; ty < ty0 + chh; ty++) {
       for (let tx = tx0; tx < tx0 + cw; tx++) {
-        if (!world.isSolid(tx, ty)) paintWall(back, (tx - tx0) * tex, (ty - ty0) * tex, tex, tx, ty);
+        const cut = this.cutsAt(world, tx, ty);
+        if (cut) cuts.set(ty * world.width + tx, cut);
+        if (cut || !world.isSolid(tx, ty)) paintWall(back, (tx - tx0) * tex, (ty - ty0) * tex, tex, tx, ty);
       }
     }
     for (const f of foliage.flowers) {
       // Flowers reach up to one tile above and a few texels sideways.
       if (f.front || f.x < tx0 - 1 || f.x > tx0 + cw || f.y < ty0 || f.y > ty0 + chh) continue;
       const spr = this.flowerBuf(f);
-      const p = new Painter(back, (f.x - tx0) * tex, (f.y + 1 - ty0) * tex, tex);
+      const p = new Painter(back, (f.x - tx0) * tex, (f.y + 1 - ty0) * tex, tex, TILE_TEX);
       p.blit(spr, TILE_TEX / 2 + flowerOffset(f) - (FLOWER_W >> 1), -spr.height);
     }
 
@@ -281,7 +289,8 @@ export class Renderer {
       for (let tx = tx0; tx < tx0 + cw; tx++) {
         const t = world.get(tx, ty);
         if (!isSolidTile(t)) continue;
-        paintTile(back, (tx - tx0) * tex, (ty - ty0) * tex, tex, t, tx, ty, !world.isSolid(tx, ty - 1));
+        const cut = cuts.get(ty * world.width + tx) ?? null;
+        paintTile(back, (tx - tx0) * tex, (ty - ty0) * tex, tex, t, tx, ty, !world.isSolid(tx, ty - 1), cut);
       }
     }
 
@@ -292,8 +301,9 @@ export class Renderer {
         const f = foliage.get(tx, ty);
         if (f !== Foliage.FloorMoss && f !== Foliage.CeilingMoss) continue;
         const p = new Painter(moss, (tx - tx0) * tex, (ty - ty0) * tex, tex);
-        if (f === Foliage.FloorMoss) paintFloorMoss(p, tx, ty);
-        else paintCeilingMoss(p, tx, ty);
+        const cut = this.cutsAt(world, tx, ty);
+        if (f === Foliage.FloorMoss) paintFloorMoss(p, tx, ty, cut);
+        else paintCeilingMoss(p, tx, ty, cut);
       }
     }
 
@@ -321,23 +331,34 @@ export class Renderer {
   private drawGrass(game: Game, v: View): void {
     const { ctx } = this;
     const { foliage, foliageAnim } = game;
-    const h = GRASS_ROWS / TILE_TEX;
+    const cell = 1 / NOISE_RES;
+    const h = GRASS_ROWS * cell;
     for (let y = v.y0; y < v.y1; y++) {
       for (let x = v.x0; x < v.x1; x++) {
         const i = y * foliage.width + x;
         if (foliage.cells[i] !== Foliage.Grass) continue;
         const spr = this.grassSprites[hashInt(x, y, 5) % GRASS_VARIANTS];
-        // Tip offset snapped to whole texels to keep the pixel-art look.
-        const lean = Math.round(foliageAnim.grassOffset(i) * GRASS_LEAN * TILE_TEX) / TILE_TEX;
-        if (lean === 0) {
+        const lean = foliageAnim.grassOffset(i) * GRASS_LEAN;
+        // Blades over a corner cut from the moss tile below would float; skip them.
+        const cut = this.cutsAt(game.world, x, y + 1);
+        const clipped = cut !== null && cut.subarray(0, NOISE_RES).some(Boolean);
+        if (lean === 0 && !clipped) {
           ctx.drawImage(spr, x, y + 1 - h, 1, h);
           continue;
         }
-        ctx.save();
-        ctx.translate(x, y + 1);
-        ctx.transform(1, 0, -lean / h, 1, 0, 0); // shear around the roots
-        ctx.drawImage(spr, 0, -h, 1, h);
-        ctx.restore();
+        // Lean row by row, each row's offset snapped to whole cells, so the
+        // patch bends in blocks rather than shearing.
+        for (let r = 0; r < GRASS_ROWS; r++) {
+          const off = Math.round((lean * (GRASS_ROWS - r)) / GRASS_ROWS / cell) * cell;
+          const ry = y + 1 - h + r * cell;
+          if (!clipped) {
+            ctx.drawImage(spr, 0, r, NOISE_RES, 1, x + off, ry, 1, cell);
+            continue;
+          }
+          for (let c = 0; c < NOISE_RES; c++) {
+            if (!cut[c]) ctx.drawImage(spr, c, r, 1, 1, x + off + c * cell, ry, cell, cell);
+          }
+        }
       }
     }
   }
@@ -355,12 +376,13 @@ export class Renderer {
         continue;
       }
       // Bend the vine: offset grows with the square of the distance from the
-      // root, reaching sin(angle) * length at the tip. Drawn in 2-texel slices.
+      // root, reaching sin(angle) * length at the tip. Drawn one cell row at a
+      // time with offsets snapped to whole cells.
       const sin = Math.sin(angle);
-      for (let sy = 0; sy < spr.height; sy += 2) {
-        const d = (sy + 1) / TILE_TEX;
-        const off = Math.round(((sin * d * d) / vine.length) * TILE_TEX) / TILE_TEX;
-        ctx.drawImage(spr, 0, sy, TILE_TEX, 2, vine.x + off, vine.y + sy / TILE_TEX, 1, 2 / TILE_TEX);
+      for (let sy = 0; sy < spr.height; sy++) {
+        const d = (sy + 1) / NOISE_RES;
+        const off = Math.round(((sin * d * d) / vine.length) * NOISE_RES) / NOISE_RES;
+        ctx.drawImage(spr, 0, sy, NOISE_RES, 1, vine.x + off, vine.y + sy / NOISE_RES, 1, 1 / NOISE_RES);
       }
     }
   }
@@ -380,7 +402,32 @@ export class Renderer {
         ctx.drawImage(this.waterSprites[surface + (hashInt(x, y, 3) % WATER_VARIANTS)], x, y, 1, 1);
       }
     }
+    // Fill the rounded corners of terrain facing the water, as if the water
+    // extended into the terrain tile. Each tile is drawn once, so overlapping
+    // fills don't darken.
+    const cell = 1 / NOISE_RES;
+    const tex = TILE_TEX / NOISE_RES;
+    for (const [i, corners] of waterCornerFills(world, v.x0 - 1, v.y0 - 1, v.x1 + 1, v.y1)) {
+      const x = i % world.width;
+      const y = (i / world.width) | 0;
+      const cut = this.cutsAt(world, x, y);
+      if (!cut) continue;
+      const surface = world.get(x, y - 1) === Tile.Empty ? WATER_VARIANTS : 0;
+      const spr = this.waterSprites[surface + (hashInt(x, y, 3) % WATER_VARIANTS)];
+      for (const c of filledCells(cut, corners)) {
+        const cx = c % NOISE_RES;
+        const cy = (c / NOISE_RES) | 0;
+        ctx.drawImage(spr, cx * tex, cy * tex, tex, tex, x + cx * cell, y + cy * cell, cell, cell);
+      }
+    }
     ctx.globalAlpha = 1;
+  }
+
+  private cutsAt(world: World, x: number, y: number): Uint8Array | null {
+    const i = y * world.width + x;
+    let cut = this.cutCache.get(i);
+    if (cut === undefined) this.cutCache.set(i, (cut = cutsAt(world, x, y)));
+    return cut;
   }
 
   private drawFrontFlowers(foliage: FoliageMap, v: View): void {

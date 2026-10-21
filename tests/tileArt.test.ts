@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Tile } from '../src/world/tiles';
-import { makeBuf, paintTile, PixelBuf, RGB, rgbToHsv, hsvToRgb, SURFACE_ROWS, TILE_STYLE } from '../src/render/tileArt';
+import { cornerCuts, makeBuf, NOISE_RES, paintTile, PixelBuf, RGB, rgbToHsv, hsvToRgb, SURFACE_ROWS, TILE_STYLE } from '../src/render/tileArt';
 
 const N = 32;
 
@@ -54,6 +54,19 @@ describe('paintTile', () => {
     expect(paint(Tile.Dirt, 7, 9, true).data).not.toEqual(paint(Tile.Dirt, 8, 9, true).data);
   });
 
+  it(`uses a ${NOISE_RES}x${NOISE_RES} noise grid: each cell is one colour at full detail`, () => {
+    const cell = N / NOISE_RES;
+    const buf = paint(Tile.Dirt, 3, 4, true);
+    const colours = new Set<string>();
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        expect(pixel(buf, x, y)).toEqual(pixel(buf, x - (x % cell), y - (y % cell)));
+        colours.add(pixel(buf, x, y).join());
+      }
+    }
+    expect(colours.size).toBeGreaterThan(NOISE_RES);
+  });
+
   it('matches the full-detail texture at lower texel densities', () => {
     const full = paint(Tile.Rock, 3, 4, true);
     const low = paint(Tile.Rock, 3, 4, true, 8);
@@ -102,5 +115,81 @@ describe('paintTile', () => {
     expect(pixel(buf, 0, 0)).toEqual([0, 0, 0]);
     expect(buf.data[(8 * 16 + 7) * 4 + 3]).toBe(255);
     expect(buf.data[(8 * 16 + 8) * 4 + 3]).toBe(0);
+  });
+});
+
+describe('cornerCuts', () => {
+  const A = NOISE_RES;
+  const cutAt = (cut: Uint8Array, x: number, y: number) => cut[y * A + x] === 1;
+  /** Cut cells of the top-left corner form a staircase anchored at the corner (no holes or notches). */
+  const isStaircase = (cut: Uint8Array) => {
+    for (let y = 0; y < A / 2; y++) {
+      for (let x = 0; x < A / 2; x++) {
+        if (!cutAt(cut, x, y)) continue;
+        if ((x > 0 && !cutAt(cut, x - 1, y)) || (y > 0 && !cutAt(cut, x, y - 1))) return false;
+      }
+    }
+    return true;
+  };
+  const topLeft = (tile: Tile, tx: number) => cornerCuts(tile, tx, 7, true, false, false, true)!;
+
+  it('only cuts corners that are open on both adjacent sides', () => {
+    expect(cornerCuts(Tile.Rock, 3, 3, true, false, false, false)).toBeNull();
+    expect(cornerCuts(Tile.Dirt, 3, 3, true, false, true, false)).toBeNull();
+    expect(cornerCuts(Tile.Water, 3, 3, true, true, true, true)).toBeNull();
+    expect(cornerCuts(Tile.Empty, 3, 3, true, true, true, true)).toBeNull();
+
+    const tr = cornerCuts(Tile.Dirt, 3, 3, true, true, false, false)!;
+    expect(cutAt(tr, A - 1, 0)).toBe(true);
+    for (let y = 0; y < A; y++) {
+      for (let x = 0; x < A; x++) if (cutAt(tr, x, y)) expect(x >= A - 4 && y < 4).toBe(true);
+    }
+  });
+
+  it('can cut every corner of a tile, leaving most of it solid', () => {
+    for (const tile of [Tile.Dirt, Tile.Rock]) {
+      const cut = cornerCuts(tile, 11, 4, true, true, true, true)!;
+      for (const [x, y] of [
+        [0, 0],
+        [A - 1, 0],
+        [0, A - 1],
+        [A - 1, A - 1],
+      ]) {
+        expect(cutAt(cut, x, y)).toBe(true);
+      }
+      expect(cut.reduce((a, b) => a + b, 0)).toBeLessThan((A * A) / 2);
+      expect(cutAt(cut, A / 2, A / 2)).toBe(false);
+    }
+  });
+
+  it('is deterministic, but varies between tiles', () => {
+    expect(topLeft(Tile.Rock, 5)).toEqual(topLeft(Tile.Rock, 5));
+    for (const tile of [Tile.Dirt, Tile.Rock]) {
+      const shapes = new Set<string>();
+      for (let tx = 0; tx < 60; tx++) shapes.add(topLeft(tile, tx).join(''));
+      expect(shapes.size).toBeGreaterThan(5);
+    }
+  });
+
+  it('gives dirt and rock the same smooth staircase corners of at least 2 cells', () => {
+    for (let tx = 0; tx < 60; tx++) {
+      const cut = topLeft(Tile.Dirt, tx);
+      expect(isStaircase(cut)).toBe(true);
+      expect(cutAt(cut, 1, 0) || cutAt(cut, 0, 1)).toBe(true);
+      expect(topLeft(Tile.Rock, tx)).toEqual(cut);
+    }
+  });
+
+  it('leaves cut cells unpainted', () => {
+    const cut = cornerCuts(Tile.Rock, 2, 2, true, true, false, false)!;
+    const buf = makeBuf(N, N);
+    paintTile(buf, 0, 0, N, Tile.Rock, 2, 2, true, cut);
+    const cell = N / A;
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const alpha = buf.data[(y * N + x) * 4 + 3];
+        expect(alpha).toBe(cutAt(cut, Math.floor(x / cell), Math.floor(y / cell)) ? 0 : 255);
+      }
+    }
   });
 });
