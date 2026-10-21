@@ -2,6 +2,8 @@
 export const WORLD_W = 200;
 export const WORLD_H = 200;
 export const TILE_PX = 16;
+/** Texels per tile at full detail. All procedural tile and foliage art is authored on this grid. */
+export const TILE_TEX = 32;
 
 // Simulation rates
 export const PHYSICS_DT = 1 / 60;

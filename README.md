@@ -1,8 +1,8 @@
 # Colony Sim
 
-A browser-based colony simulation prototype with a 2D side-view tile platformer view. The world is a 200×200 tile grid of dirt, rock, water and open caves. You directly control a small group of colonists: select them with the mouse, send them to a location, or order them to dig out dirt.
+A browser-based colony simulation prototype with a 2D side-view tile platformer view. The world is a 200×200 tile grid of dirt, rock, water and open caves, overgrown with moss, grass, hanging vines and flowers. You directly control a small group of colonists: select them with the mouse, send them to a location, or order them to dig out dirt.
 
-Built with TypeScript, Vite and the HTML5 Canvas 2D API. There is no game framework and no image assets; sprites are drawn in code.
+Built with TypeScript, Vite and the HTML5 Canvas 2D API. There is no game framework and no image assets; tiles, foliage and sprites are generated in code.
 
 ![The starting colony: three colonists in the central clearing, surrounded by dirt, rock and caves (seed 42)](screenshot.png)
 
@@ -46,6 +46,61 @@ While colonists are selected, the hovered tile is outlined yellow (dig), red (ca
 
 Colonists can stand on dirt and rock. Water is passable: colonists walk and sink through it. The map edge acts as solid rock.
 
+Each tile is drawn as a 32×32 procedural texture:
+
+| Tile | Base colour | Surface colour | Pixel noise (hue / saturation / brightness) |
+| --- | --- | --- | --- |
+| Dirt | rgb(137, 94, 58) | rgb(184, 129, 84) | 1% / 15% / 20% |
+| Rock | rgb(111, 115, 126) | rgb(151, 156, 167) | 5% / 12% / 7% |
+| Water | rgb(75, 134, 206) | rgb(127, 182, 238) | 2% / 5% / 3% |
+
+The base colour is layer 20 and the per-pixel noise is layer 21. When a tile has open space above it, its top 8 rows use the surface colour and the noise there is drawn at 50% opacity. For dirt and rock, "open" means not solid, so water above still shows the surface. For water, it means an empty tile. The noise is hashed from the pixel's position, so a tile looks the same every time it is redrawn.
+
+### Foliage
+
+Foliage is decoration only: it never affects pathfinding or movement. It lives in a second 200×200 array next to the terrain, holding one of: empty, floor moss, ceiling moss, hanging vine or grass. Flowers are kept in a separate list. Foliage is generated once, after the terrain, in these passes:
+
+1. **Floor moss** grows on solid tiles that have an empty tile above:
+   - rock: 15% chance, or 80% if there is water within 20 tiles;
+   - dirt: always, if the tiles on both sides are dirt too.
+2. **Ceiling moss** follows the same rules for solid tiles with an empty tile below. A one-tile-thick shelf qualifies for both; ceiling moss wins.
+3. **Grass** grows in the empty tile above a floor-moss tile that has another floor-moss tile to its left or right.
+4. **Hanging vines**: each ceiling-moss tile has a 20% chance of a vine. Its length is random, between 1 and the number of open tiles below it (empty in both arrays), up to 5.
+5. **Background flowers**: 10% of grass tiles. They are 10–40% of a colonist's height, ±10%.
+6. **Foreground flowers**: 10% of grass tiles, rolled independently. They are 30–55% of a colonist's height, ±15%, kept below a solid tile directly above.
+
+Each foliage type is drawn in pixel art:
+
+| Foliage | Look |
+| --- | --- |
+| Floor moss | Covers the top 1–7 pixel rows of its tile and reaches 1–3 rows into the tile above. |
+| Ceiling moss | A dark, web-like net over the bottom 20–50% of its tile and the top 10–20% of the tile below. |
+| Grass | Green strokes 0.15–0.4 tiles tall, with moss-coloured roots. |
+| Vines | Green, with white spike pixels. They fade in from the ceiling-moss colour at the top. |
+| Flowers | A stem, leaves on both sides (0–3 for background flowers, 1–5 for foreground) and a random petal colour. Background flowers have a darker centre, foreground flowers a lighter one. |
+
+Grass wiggles briefly when a colonist enters or leaves it. Vines swing like a damped pendulum, pushed in the direction the colonist is moving.
+
+Digging removes foliage that loses its support: moss on the dug tile, grass with no floor moss below it (and that grass's flowers), and vines whose ceiling moss is gone. Nothing regrows.
+
+### Render layers
+
+Layers are drawn in ascending order:
+
+| Layer | Contents |
+| --- | --- |
+| 10 | Procedural cave wall, then background flowers (10–19 is the background range) |
+| 20 | Terrain base colour |
+| 21 | Terrain pixel noise |
+| 22 | Grass |
+| 23 | Hanging vines |
+| 24 | Floor and ceiling moss |
+| 25 | Colonists (and planned paths) |
+| 26 | Water, drawn over colonists so they look submerged |
+| 31 | Foreground flowers |
+
+Layers 0–9, 11–19, 27–30 and 32–49 are free for future use. Selection, hover and dig markers are drawn on top of everything.
+
 ### Water
 
 Water updates 10 times per second. Each water tile:
@@ -82,10 +137,23 @@ The path graph's nodes are "foot tiles": a tile where a colonist's 2-tall body f
 Maps are generated from a seed (`src/world/worldgen.ts`):
 
 1. Fill the entire 200×200 map with dirt.
-2. Sample a Perlin noise field (3-octave fBm) and turn the top 20% of values into empty tiles, which carves cave-like pockets. Thresholding at the 80th percentile keeps the empty share at about 20% for every seed.
-3. Sample a second, independent Perlin noise field over the remaining dirt tiles and turn the half above the median into rock.
-4. Open a 20×4 empty clearing at the center of the map (x 90–109, y 98–101). Any gaps in the row beneath it are filled with dirt so the colony has a floor. Spawn 3 colonists side by side in the clearing.
-5. Place two 10×4 water clusters, one about 50 tiles above and one about 50 tiles below the colony (±3 tiles vertically, ±20 tiles horizontally from center). They overwrite whatever was there, then fall and spread into nearby caves once the simulation runs.
+2. **Water pits.** Place four water rects, each 15–25 wide and 4–8 tall:
+   - two centred about 50 tiles above the map center and two about 50 below (±3 tiles vertically);
+   - in each pair, one is 15–35 tiles left of center and the other 15–35 tiles right, so they never overlap.
+
+   Each pit is filled with the **edge jagging process** (`jagRect`): every tile along each edge is moved −1, 0 or +1 tiles along that edge's outward normal, so the outline is ragged.
+3. **Dig caves.** Sample a Perlin noise field (3-octave fBm) and turn the top 20% of values into empty tiles, which carves cave-like pockets. Thresholding at the 80th percentile keeps the empty share at about 20% for every seed. Water tiles are left alone.
+4. **Dirt to rock.** Sample a second, independent Perlin noise field over the remaining dirt tiles and turn the half above the median into rock.
+5. **Spawn point.**
+   - Open a 20×4 empty clearing at the center of the map (x 90–109, y 98–101), with its top, left and right edges jagged as in step 2.
+   - Fill any gaps in the row beneath it with dirt so the colony has a floor.
+   - Spawn 3 colonists side by side in the clearing.
+   - Pick a random **dominant side**, left or right.
+6. **Starting pond.** Place a 10×4 water rect 20–30 tiles beside the clearing on the dominant side, with its bottom row within 2 tiles of the spawn floor's height.
+
+Water overwrites whatever was there. Once the simulation runs, it falls and spreads into nearby caves.
+
+7. **Foliage.** Run the foliage passes described under [Foliage](#foliage).
 
 ## Project layout
 
@@ -98,22 +166,40 @@ Maps are generated from a seed (`src/world/worldgen.ts`):
 | `src/world/World.ts` | Tile grid, change counters for terrain and water |
 | `src/world/noise.ts` | Seeded 2D Perlin noise and fBm |
 | `src/world/rng.ts` | Seeded PRNG (mulberry32) |
-| `src/world/worldgen.ts` | The 5-step map generator |
+| `src/world/worldgen.ts` | The 7-step map generator and the edge jagging process |
+| `src/world/foliage.ts` | Foliage array, spawn passes and removal after digging |
 | `src/sim/water.ts` | Cellular water simulation |
+| `src/sim/foliageAnim.ts` | Grass wiggle and vine swing when colonists pass |
 | `src/sim/pathfinding.ts` | Path graph and A* search |
 | `src/entities/Colonist.ts` | Colonist physics, state machine and path following |
 | `src/game/Game.ts` | Game state: world, colonists, selection, commands |
 | `src/input/Input.ts` | Mouse selection and commands, camera keys |
 | `src/render/Camera.ts` | Pan/zoom and screen-to-world conversion |
-| `src/render/Renderer.ts` | Draws terrain, water, colonists and overlays |
-| `tests/` | Vitest tests for worldgen, water, pathfinding, colonists and a full game run |
+| `src/render/Renderer.ts` | Runs the layer passes: chunk-cached terrain and moss, foliage, colonists, water, overlays |
+| `src/render/layers.ts` | Render layer numbers |
+| `src/render/tileArt.ts` | Procedural tile and wall textures (pure; no DOM) |
+| `src/render/foliageArt.ts` | Pixel-art moss, grass, vine and flower generators (pure; no DOM) |
+| `tests/` | Vitest tests for worldgen, edge jagging, foliage, tile and foliage art, animation, water, pathfinding, colonists and a full game run |
 
 ## Tuning
 
-Gameplay numbers live in `src/config.ts`: world size, gravity, walk/air speed, jump height, fall speed in and out of water, dig time, stuck/retry limits and simulation tick rates. Generation parameters (empty fraction, clearing size, water cluster size and distance) are constants at the top of `src/world/worldgen.ts`.
+Gameplay numbers live in `src/config.ts`: world size, texels per tile, gravity, walk/air speed, jump height, fall speed in and out of water, dig time, stuck/retry limits and simulation tick rates. Generation parameters (empty fraction, clearing size, water pit and pond size and distance) are constants at the top of `src/world/worldgen.ts`. Foliage chances are at the top of `src/world/foliage.ts`, tile colours in `src/render/tileArt.ts`, and animation constants in `src/sim/foliageAnim.ts`.
+
+### Rendering performance
+
+Rather than one huge texture, the terrain and moss are baked in 16×16-tile chunks.
+- Chunks are built only when they come into view.
+- When tiles change, only the chunks around them are rebuilt. The old image stays on screen until the new one is ready, so nothing flickers.
+- Chunks bake at 32, 16 or 8 texels per tile depending on zoom.
+- The least recently drawn chunks are dropped once a memory budget is exceeded.
+
+Water, grass, vines and foreground flowers are drawn each frame from cached sprites.
 
 ## Known limitations
 
 - When a pool has a few extra tiles that don't fill a whole new layer, they keep sliding back and forth on the surface. This follows directly from the random left/right rule.
 - Colonists ordered as a group all head for the same tile and overlap there.
 - There is no fall damage, drowning or other colonist needs yet.
+- Foliage never regrows. Tiles exposed by digging stay bare.
+- The starting pond overwrites the terrain where it lands. If there is a cave below, it drains into it.
+- The 8×16 colonist sprite is coarser than the 32-texel tiles.

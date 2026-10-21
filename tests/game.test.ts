@@ -20,6 +20,7 @@ describe('Game on a generated map', () => {
   for (const seed of [1, 42, 2024]) {
     it(`seed ${seed}: colonists settle, cross the clearing, and water is conserved`, () => {
       const game = new Game(seed);
+      const water = countTiles(game.world, Tile.Water);
       run(game, 1);
       for (const c of game.colonists) expect(c.currentNode(game.world)).toEqual({ x: Math.floor(c.px), y: 101 });
 
@@ -29,7 +30,7 @@ describe('Game on a generated map', () => {
       run(game, 8);
       expect(c.state).toBe('idle');
       expect(c.currentNode(game.world)).toEqual({ x: 108, y: 101 });
-      expect(countTiles(game.world, Tile.Water)).toBe(80);
+      expect(countTiles(game.world, Tile.Water)).toBe(water);
     });
   }
 });

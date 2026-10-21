@@ -1,20 +1,36 @@
 import { Colonist } from '../entities/Colonist';
 import { FLASH_TIME, Game } from '../game/Game';
 import { Input } from '../input/Input';
-import { Tile } from '../world/tiles';
+import { Flower, Foliage, FoliageMap, Vine } from '../world/foliage';
+import { Tile, isSolidTile } from '../world/tiles';
 import { World } from '../world/World';
-import { DIG_TIME } from '../config';
+import { DIG_TIME, TILE_TEX } from '../config';
 import { Camera } from './Camera';
+import {
+  FLOWER_W,
+  GRASS_ROWS,
+  GRASS_VARIANTS,
+  Painter,
+  flowerOffset,
+  flowerSprite,
+  grassSprite,
+  paintCeilingMoss,
+  paintFloorMoss,
+  vineSprite,
+} from './foliageArt';
+import { Layer } from './layers';
+import { PixelBuf, hashInt, makeBuf, paintTile, paintWall } from './tileArt';
 
-/** Texels per tile in the cached terrain texture. */
-const TEX = 4;
-
-type RGB = [number, number, number];
-const BG: RGB = [20, 23, 32];
-const DIRT: RGB = [122, 84, 52];
-const ROCK: RGB = [104, 108, 118];
-const WATER: [number, number, number, number] = [52, 120, 220, 150];
-const WATER_SURFACE: [number, number, number, number] = [120, 180, 255, 190];
+/** The world is baked in CHUNK x CHUNK tile pieces, rebuilt only when their tiles change. */
+const CHUNK = 16;
+/** Texel budget for cached chunk canvases; least recently drawn chunks are dropped beyond it. */
+const CHUNK_BUDGET = 32 * 1024 * 1024;
+/** Chunk rebuilds per frame while an older image of the chunk can be shown meanwhile. */
+const REBUILDS_PER_FRAME = 4;
+const WATER_ALPHA = 0.8;
+const WATER_VARIANTS = 4;
+/** Grass tips lean at most this far (tiles) when wiggling. */
+const GRASS_LEAN = 0.25;
 
 // 8x16 colonist sprite. h=hair s=skin e=eye c=shirt p=pants b=boots
 const SPRITE_TOP = [
@@ -42,10 +58,28 @@ const PALETTE: Record<string, string> = {
   b: '#262626',
 };
 
-function hash(x: number, y: number): number {
-  let h = Math.imul(x, 374761393) + Math.imul(y, 668265263);
-  h = Math.imul(h ^ (h >>> 13), 1274126177);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+/** Visible tile range [x0, x1) x [y0, y1), and one CSS pixel in tile units. */
+interface View {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  px: number;
+}
+
+interface Pass {
+  layer: Layer;
+  draw: (game: Game, view: View) => void;
+}
+
+interface Chunk {
+  /** Layers 10–21: wall, background flowers, terrain base and noise. */
+  back: HTMLCanvasElement;
+  /** Layer 24: moss. */
+  moss: HTMLCanvasElement;
+  tex: number;
+  dirty: boolean;
+  used: number;
 }
 
 function makeCanvas(w: number, h: number): HTMLCanvasElement {
@@ -55,18 +89,60 @@ function makeCanvas(w: number, h: number): HTMLCanvasElement {
   return c;
 }
 
+function toCanvas(buf: PixelBuf): HTMLCanvasElement {
+  const c = makeCanvas(buf.width, buf.height);
+  const img = buf instanceof ImageData ? buf : new ImageData(buf.width, buf.height);
+  if (img !== buf) img.data.set(buf.data);
+  c.getContext('2d')!.putImageData(img, 0, 0);
+  return c;
+}
+
 export class Renderer {
   private readonly ctx: CanvasRenderingContext2D;
-  private readonly terrain: HTMLCanvasElement;
-  private readonly water: HTMLCanvasElement;
-  private terrainVersion = -1;
-  private waterVersion = -1;
+  private readonly passes: Pass[];
+  private readonly chunks = new Map<number, Chunk>();
+  private readonly chunksX: number;
+  /** What the baked chunks were built from: solid tile type (0 if not solid) and foliage per tile. */
+  private readonly tileSnap: Uint8Array;
+  private readonly cellSnap: Uint8Array;
+  private worldVersion = -1;
+  private foliageVersion = -1;
+  private tex = TILE_TEX;
+  private frame = 0;
+  private rebuilds = 0;
   private readonly sprites = new Map<string, HTMLCanvasElement[]>();
+  private readonly waterSprites: HTMLCanvasElement[] = [];
+  private readonly grassSprites: HTMLCanvasElement[] = [];
+  private readonly vineSprites = new Map<Vine, HTMLCanvasElement>();
+  private readonly flowerBufs = new Map<Flower, PixelBuf>();
+  private readonly flowerSprites = new Map<Flower, HTMLCanvasElement>();
 
   constructor(private readonly canvas: HTMLCanvasElement, world: World) {
     this.ctx = canvas.getContext('2d')!;
-    this.terrain = makeCanvas(world.width * TEX, world.height * TEX);
-    this.water = makeCanvas(world.width, world.height);
+    this.chunksX = Math.ceil(world.width / CHUNK);
+    this.tileSnap = new Uint8Array(world.width * world.height);
+    this.cellSnap = new Uint8Array(world.width * world.height);
+    for (let i = 0; i < world.tiles.length; i++) this.tileSnap[i] = isSolidTile(world.tiles[i]) ? world.tiles[i] : 0;
+
+    for (let v = 0; v < WATER_VARIANTS * 2; v++) {
+      const buf = makeBuf(TILE_TEX, TILE_TEX);
+      paintTile(buf, 0, 0, TILE_TEX, Tile.Water, v % WATER_VARIANTS, 0, v >= WATER_VARIANTS);
+      this.waterSprites.push(toCanvas(buf));
+    }
+    for (let v = 0; v < GRASS_VARIANTS; v++) this.grassSprites.push(toCanvas(grassSprite(v)));
+
+    // Stable sort: passes on the same layer keep this order.
+    this.passes = (
+      [
+        { layer: Layer.Wall, draw: (g, v) => this.drawChunks(g, v, 'back') },
+        { layer: Layer.Grass, draw: (g, v) => this.drawGrass(g, v) },
+        { layer: Layer.Vine, draw: (g, v) => this.drawVines(g, v) },
+        { layer: Layer.Moss, draw: (g, v) => this.drawChunks(g, v, 'moss') },
+        { layer: Layer.Colonist, draw: (g, v) => this.drawColonists(g, v) },
+        { layer: Layer.Water, draw: (g, v) => this.drawWater(g.world, v) },
+        { layer: Layer.FrontFlower, draw: (g, v) => this.drawFrontFlowers(g.foliage, v) },
+      ] as Pass[]
+    ).sort((a, b) => a.layer - b.layer);
   }
 
   draw(game: Game, cam: Camera, input: Input): void {
@@ -74,8 +150,7 @@ export class Renderer {
     const world = game.world;
     const dpr = window.devicePixelRatio || 1;
 
-    if (world.version !== this.terrainVersion) this.rebuildTerrain(world);
-    if (world.waterVersion !== this.waterVersion) this.rebuildWater(world);
+    this.syncCaches(world, game.foliage);
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#0d0f14';
@@ -86,13 +161,21 @@ export class Renderer {
     ctx.imageSmoothingEnabled = false;
     const px = 1 / cam.scale; // one CSS pixel in tile units
 
-    ctx.drawImage(this.terrain, 0, 0, world.width, world.height);
+    // Texel density follows zoom so zoomed-out views bake small chunks.
+    this.tex = s >= 24 ? TILE_TEX : s >= 12 ? TILE_TEX / 2 : TILE_TEX / 4;
+    this.frame++;
+    this.rebuilds = REBUILDS_PER_FRAME;
+    const tl = cam.screenToWorld(0, 0);
+    const br = cam.screenToWorld(cam.viewW, cam.viewH);
+    const view: View = {
+      x0: Math.max(0, Math.floor(tl.x)),
+      y0: Math.max(0, Math.floor(tl.y)),
+      x1: Math.min(world.width, Math.ceil(br.x)),
+      y1: Math.min(world.height, Math.ceil(br.y)),
+      px,
+    };
 
-    for (const c of game.selected) this.drawPath(c, px);
-    for (const c of game.colonists) this.drawColonist(c);
-
-    // Water goes over colonists so they look submerged.
-    ctx.drawImage(this.water, 0, 0, world.width, world.height);
+    for (const pass of this.passes) pass.draw(game, view);
 
     for (const c of game.colonists) {
       if (c.goal?.kind === 'dig') this.drawDigTarget(c, px);
@@ -110,55 +193,205 @@ export class Renderer {
     ctx.strokeStyle = '#444b5a';
     ctx.lineWidth = 2 * px;
     ctx.strokeRect(0, 0, world.width, world.height);
+
+    this.evictChunks();
   }
 
-  private rebuildTerrain(world: World): void {
-    this.terrainVersion = world.version;
-    const w = world.width * TEX;
-    const img = new ImageData(w, world.height * TEX);
-    const d = img.data;
-    for (let ty = 0; ty < world.height; ty++) {
-      for (let tx = 0; tx < world.width; tx++) {
-        const t = world.get(tx, ty);
-        const solid = t === Tile.Dirt || t === Tile.Rock;
-        const base = t === Tile.Dirt ? DIRT : t === Tile.Rock ? ROCK : BG;
-        const shade = solid ? 0.88 + hash(tx, ty) * 0.24 : 1;
-        const exposedTop = solid && !world.isSolid(tx, ty - 1);
-        for (let sy = 0; sy < TEX; sy++) {
-          for (let sx = 0; sx < TEX; sx++) {
-            let k = shade;
-            if (solid) {
-              k *= 0.94 + hash(tx * TEX + sx, ty * TEX + sy) * 0.12;
-              if (exposedTop && sy === 0) k *= t === Tile.Dirt ? 1.35 : 1.25;
-            }
-            const o = ((ty * TEX + sy) * w + tx * TEX + sx) * 4;
-            d[o] = Math.min(255, base[0] * k);
-            d[o + 1] = Math.min(255, base[1] * k);
-            d[o + 2] = Math.min(255, base[2] * k);
-            d[o + 3] = 255;
-          }
+  /** Marks chunks dirty around every tile whose terrain or foliage changed since the last bake. */
+  private syncCaches(world: World, foliage: FoliageMap): void {
+    if (world.version === this.worldVersion && foliage.version === this.foliageVersion) return;
+    if (foliage.version !== this.foliageVersion) {
+      const vines = new Set(foliage.vines);
+      const flowers = new Set(foliage.flowers);
+      for (const v of this.vineSprites.keys()) if (!vines.has(v)) this.vineSprites.delete(v);
+      for (const f of this.flowerBufs.keys()) if (!flowers.has(f)) this.flowerBufs.delete(f);
+      for (const f of this.flowerSprites.keys()) if (!flowers.has(f)) this.flowerSprites.delete(f);
+    }
+    this.worldVersion = world.version;
+    this.foliageVersion = foliage.version;
+    const { width: w, tiles } = world;
+    for (let i = 0; i < tiles.length; i++) {
+      const t = isSolidTile(tiles[i]) ? tiles[i] : 0;
+      if (t === this.tileSnap[i] && foliage.cells[i] === this.cellSnap[i]) continue;
+      this.tileSnap[i] = t;
+      this.cellSnap[i] = foliage.cells[i];
+      // Neighbours depend on this tile too (surface band, moss spill, flowers).
+      const x = i % w;
+      const y = (i / w) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const ch = this.chunks.get(this.chunkKey(Math.floor((x + dx) / CHUNK), Math.floor((y + dy) / CHUNK)));
+          if (ch) ch.dirty = true;
         }
       }
     }
-    this.terrain.getContext('2d')!.putImageData(img, 0, 0);
   }
 
-  private rebuildWater(world: World): void {
-    this.waterVersion = world.waterVersion;
-    const img = new ImageData(world.width, world.height);
-    const d = img.data;
-    for (let y = 0; y < world.height; y++) {
-      for (let x = 0; x < world.width; x++) {
-        if (world.get(x, y) !== Tile.Water) continue;
-        const c = world.get(x, y - 1) === Tile.Water ? WATER : WATER_SURFACE;
-        const o = (y * world.width + x) * 4;
-        d[o] = c[0];
-        d[o + 1] = c[1];
-        d[o + 2] = c[2];
-        d[o + 3] = c[3];
+  private chunkKey(cx: number, cy: number): number {
+    return cy * this.chunksX + cx;
+  }
+
+  private drawChunks(game: Game, v: View, which: 'back' | 'moss'): void {
+    if (v.x1 <= v.x0 || v.y1 <= v.y0) return;
+    const { world } = game;
+    for (let cy = Math.floor(v.y0 / CHUNK); cy <= Math.floor((v.y1 - 1) / CHUNK); cy++) {
+      for (let cx = Math.floor(v.x0 / CHUNK); cx <= Math.floor((v.x1 - 1) / CHUNK); cx++) {
+        const key = this.chunkKey(cx, cy);
+        let ch = this.chunks.get(key);
+        // Rebuild only in the first chunk pass so a chunk's back and moss images always match.
+        // Missing chunks are always built; stale ones are rebuilt a few per frame.
+        if (which === 'back' && (!ch || ((ch.dirty || ch.tex !== this.tex) && this.rebuilds-- > 0))) {
+          ch = this.buildChunk(game, cx, cy);
+          this.chunks.set(key, ch);
+        }
+        if (!ch) continue;
+        ch.used = this.frame;
+        const w = Math.min(CHUNK, world.width - cx * CHUNK);
+        const h = Math.min(CHUNK, world.height - cy * CHUNK);
+        this.ctx.drawImage(ch[which], cx * CHUNK, cy * CHUNK, w, h);
       }
     }
-    this.water.getContext('2d')!.putImageData(img, 0, 0);
+  }
+
+  private buildChunk(game: Game, cx: number, cy: number): Chunk {
+    const { world, foliage } = game;
+    const tex = this.tex;
+    const tx0 = cx * CHUNK;
+    const ty0 = cy * CHUNK;
+    const cw = Math.min(CHUNK, world.width - tx0);
+    const chh = Math.min(CHUNK, world.height - ty0);
+
+    // Layer 10: the cave wall behind every open tile, then background flowers.
+    const back = new ImageData(cw * tex, chh * tex);
+    for (let ty = ty0; ty < ty0 + chh; ty++) {
+      for (let tx = tx0; tx < tx0 + cw; tx++) {
+        if (!world.isSolid(tx, ty)) paintWall(back, (tx - tx0) * tex, (ty - ty0) * tex, tex, tx, ty);
+      }
+    }
+    for (const f of foliage.flowers) {
+      // Flowers reach up to one tile above and a few texels sideways.
+      if (f.front || f.x < tx0 - 1 || f.x > tx0 + cw || f.y < ty0 || f.y > ty0 + chh) continue;
+      const spr = this.flowerBuf(f);
+      const p = new Painter(back, (f.x - tx0) * tex, (f.y + 1 - ty0) * tex, tex);
+      p.blit(spr, TILE_TEX / 2 + flowerOffset(f) - (FLOWER_W >> 1), -spr.height);
+    }
+
+    // Layers 20–21: terrain base colour and pixel noise.
+    for (let ty = ty0; ty < ty0 + chh; ty++) {
+      for (let tx = tx0; tx < tx0 + cw; tx++) {
+        const t = world.get(tx, ty);
+        if (!isSolidTile(t)) continue;
+        paintTile(back, (tx - tx0) * tex, (ty - ty0) * tex, tex, t, tx, ty, !world.isSolid(tx, ty - 1));
+      }
+    }
+
+    // Layer 24: moss, including moss on the rows just outside that spills in.
+    const moss = new ImageData(cw * tex, chh * tex);
+    for (let ty = ty0 - 1; ty <= ty0 + chh; ty++) {
+      for (let tx = tx0; tx < tx0 + cw; tx++) {
+        const f = foliage.get(tx, ty);
+        if (f !== Foliage.FloorMoss && f !== Foliage.CeilingMoss) continue;
+        const p = new Painter(moss, (tx - tx0) * tex, (ty - ty0) * tex, tex);
+        if (f === Foliage.FloorMoss) paintFloorMoss(p, tx, ty);
+        else paintCeilingMoss(p, tx, ty);
+      }
+    }
+
+    return { back: toCanvas(back), moss: toCanvas(moss), tex, dirty: false, used: this.frame };
+  }
+
+  private evictChunks(): void {
+    let texels = 0;
+    for (const ch of this.chunks.values()) texels += ch.back.width * ch.back.height * 2;
+    if (texels <= CHUNK_BUDGET) return;
+    const old = [...this.chunks].filter(([, ch]) => ch.used !== this.frame).sort((a, b) => a[1].used - b[1].used);
+    for (const [key, ch] of old) {
+      if (texels <= CHUNK_BUDGET) break;
+      texels -= ch.back.width * ch.back.height * 2;
+      this.chunks.delete(key);
+    }
+  }
+
+  private flowerBuf(f: Flower): PixelBuf {
+    let buf = this.flowerBufs.get(f);
+    if (!buf) this.flowerBufs.set(f, (buf = flowerSprite(f)));
+    return buf;
+  }
+
+  private drawGrass(game: Game, v: View): void {
+    const { ctx } = this;
+    const { foliage, foliageAnim } = game;
+    const h = GRASS_ROWS / TILE_TEX;
+    for (let y = v.y0; y < v.y1; y++) {
+      for (let x = v.x0; x < v.x1; x++) {
+        const i = y * foliage.width + x;
+        if (foliage.cells[i] !== Foliage.Grass) continue;
+        const spr = this.grassSprites[hashInt(x, y, 5) % GRASS_VARIANTS];
+        // Tip offset snapped to whole texels to keep the pixel-art look.
+        const lean = Math.round(foliageAnim.grassOffset(i) * GRASS_LEAN * TILE_TEX) / TILE_TEX;
+        if (lean === 0) {
+          ctx.drawImage(spr, x, y + 1 - h, 1, h);
+          continue;
+        }
+        ctx.save();
+        ctx.translate(x, y + 1);
+        ctx.transform(1, 0, -lean / h, 1, 0, 0); // shear around the roots
+        ctx.drawImage(spr, 0, -h, 1, h);
+        ctx.restore();
+      }
+    }
+  }
+
+  private drawVines(game: Game, v: View): void {
+    const { ctx } = this;
+    const { foliage, foliageAnim } = game;
+    for (const vine of foliage.vines) {
+      if (vine.x < v.x0 - 1 || vine.x > v.x1 || vine.y > v.y1 || vine.y + vine.length < v.y0) continue;
+      let spr = this.vineSprites.get(vine);
+      if (!spr) this.vineSprites.set(vine, (spr = toCanvas(vineSprite(vine))));
+      const angle = foliageAnim.vineAngle(vine);
+      if (angle === 0) {
+        ctx.drawImage(spr, vine.x, vine.y, 1, vine.length);
+        continue;
+      }
+      // Bend the vine: offset grows with the square of the distance from the
+      // root, reaching sin(angle) * length at the tip. Drawn in 2-texel slices.
+      const sin = Math.sin(angle);
+      for (let sy = 0; sy < spr.height; sy += 2) {
+        const d = (sy + 1) / TILE_TEX;
+        const off = Math.round(((sin * d * d) / vine.length) * TILE_TEX) / TILE_TEX;
+        ctx.drawImage(spr, 0, sy, TILE_TEX, 2, vine.x + off, vine.y + sy / TILE_TEX, 1, 2 / TILE_TEX);
+      }
+    }
+  }
+
+  private drawColonists(game: Game, v: View): void {
+    for (const c of game.selected) this.drawPath(c, v.px);
+    for (const c of game.colonists) this.drawColonist(c);
+  }
+
+  private drawWater(world: World, v: View): void {
+    const { ctx } = this;
+    ctx.globalAlpha = WATER_ALPHA;
+    for (let y = v.y0; y < v.y1; y++) {
+      for (let x = v.x0; x < v.x1; x++) {
+        if (world.get(x, y) !== Tile.Water) continue;
+        const surface = world.get(x, y - 1) === Tile.Empty ? WATER_VARIANTS : 0;
+        ctx.drawImage(this.waterSprites[surface + (hashInt(x, y, 3) % WATER_VARIANTS)], x, y, 1, 1);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  private drawFrontFlowers(foliage: FoliageMap, v: View): void {
+    for (const f of foliage.flowers) {
+      if (!f.front || f.x < v.x0 - 1 || f.x > v.x1 || f.y < v.y0 - 1 || f.y > v.y1 + 1) continue;
+      let spr = this.flowerSprites.get(f);
+      if (!spr) this.flowerSprites.set(f, (spr = toCanvas(this.flowerBuf(f))));
+      const h = spr.height / TILE_TEX;
+      const x = f.x + (TILE_TEX / 2 + flowerOffset(f) - (FLOWER_W >> 1)) / TILE_TEX;
+      this.ctx.drawImage(spr, x, f.y + 1 - h, FLOWER_W / TILE_TEX, h);
+    }
   }
 
   private spriteFrames(shirt: string): HTMLCanvasElement[] {
