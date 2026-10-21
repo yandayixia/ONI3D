@@ -4,6 +4,8 @@ A browser-based colony simulation prototype with a 2D side-view tile platformer 
 
 Built with TypeScript, Vite and the HTML5 Canvas 2D API. There is no game framework and no image assets; sprites are drawn in code.
 
+![The starting colony: three colonists in the central clearing, surrounded by dirt, rock and caves (seed 42)](screenshot.png)
+
 ## Getting started
 
 ```sh
